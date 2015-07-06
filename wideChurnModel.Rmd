@@ -1,0 +1,137 @@
+```{r}
+library(glmnet)
+library(ggplot2)
+library(WVPlots)
+```
+
+Modeling functions
+```{r}
+# assuming xframe is entirely numeric
+ridge_predict_function = function(model) {
+  # to get around the 'unfullfilled promise' leak. blech.
+  force(model) 
+  function(xframe) {
+    as.numeric(predict(model, newx=as.matrix(xframe), type="response"))
+  }
+}
+
+# assuming the xframe is entirely numeric
+# if there are categories, we would have to use 
+#   model_matrix, or something
+# assuming family is one of c("binomial", "gaussian")
+#   should have a check for that
+ridge_model = function(xframe, y, family="binomial") {
+  model = glmnet(as.matrix(xframe), y, alpha=0, 
+                 lambda=0.001, family=family)
+  list(coef = coef(model),
+       deviance = deviance(model),
+       predfun = ridge_predict_function(model)
+  )
+}
+```
+
+```{r model}
+# loads vars (names of vars), yVar (name of y column), 
+# dTrainS, dTestS
+load("wideData.rData")
+
+model = ridge_model(dTrainS[,vars], dTrainS[[yVar]])
+
+names = rownames(model$coef)
+coefs = as.vector(model$coef)
+names(coefs) = names
+ord = order(abs(coefs), decreasing=TRUE)
+coefs[ord]
+
+testpred = model$predfun(dTestS[,vars])
+dTestS$pred = testpred
+
+DoubleDensityPlot(dTestS, "pred", yVar, 
+                  title="Model Score Distribution")
+ROCPlot(dTestS, "pred", yVar, title="ROC plot")
+GainCurvePlot(dTestS, "pred", yVar, title="Gain plot")
+
+```
+
+Evaluate the positive examples. Do we detect churn in time?
+
+*Note: from the implementation, we know that things in "bad" state
+will leave in about 5 days. things not in bad state will leave in about 15 days.*
+
+```{r evaluate}
+dTestS$predictedToLeave = dTestS$pred>0.5
+
+# confusion matrix
+cmat = table(pred=dTestS$predictedToLeave, actual=dTestS[[yVar]])
+cmat
+recall = cmat[2,2]/sum(cmat[,2])
+recall
+precision = cmat[2,2]/sum(cmat[2,])
+precision
+
+# make daysToX finite. The idea is that the live-forevers should be rare
+isinf = dTestS$daysToX==Inf
+maxval = max(dTestS$daysToX[!isinf])
+dTestS$daysToX = with(dTestS, ifelse(daysToX==Inf, maxval, daysToX))
+
+# how long on average until flagged customers leave?
+posmean = mean(dTestS[dTestS$predictedToLeave, "daysToX"])
+posmean
+
+# how long on average until unflagged customers leave?
+negmean = mean(dTestS[!dTestS$predictedToLeave, "daysToX"])
+negmean
+
+print(negmean-posmean) # theoretically, the difference can't be above 10
+```
+
+```{r drilldown}
+# xvar is integral
+dist_and_mean = function(frm, xvar, title, meanlabel) {
+  meanval = mean(frm[[xvar]])
+  mode = max(table(frm[[xvar]]))
+  print(paste("Mean days until exit:", meanval))
+  
+  DiscreteDistribution(frm, xvar, title=title) +
+    geom_vline(xintercept=meanval, color="blue", linetype=2)+
+    annotate("text", x=meanval, y=mode,
+             hjust=0, vjust=0,
+             label=meanlabel,
+             color="blue")
+}
+
+
+# how long until true positives (customers flagged as leaving who really do leave) leave?
+tpfilter = dTestS$predictedToLeave & dTestS[[yVar]]
+dist_and_mean(dTestS[tpfilter,], "daysToX", 
+              "Distribution of days til exit, true positives",
+              "mean days til exit") 
+              
+
+# same plot as above for all positives and all negatives
+dist_and_mean(dTestS[dTestS$predictedToLeave,], "daysToX",
+               "Distribution of days til exit, predicted positive",
+              "mean days til exit") + geom_vline(xintercept=7, color="red")
+
+dist_and_mean(dTestS[!dTestS$predictedToLeave,], "daysToX",
+               "Distribution of days til exit, predicted negative",
+              "mean days til exit") + geom_vline(xintercept=7, color="red")
+
+# how soon do the actual positives that we missed leave?
+falsenegmean = mean(dTestS[!dTestS$predictedToLeave & dTestS[[yVar]], "daysToX"])
+falsenegmean
+
+# alternative to the double density plot above;
+# plots days to churn, instead of model score
+ggplot(dTestS, aes_string(x="daysToX", color="predictedToLeave")) +
+  geom_density(adjust=0.5) + 
+  geom_vline(xintercept=7, color="darkgray") +
+  geom_vline(xintercept=posmean, color="cyan4", linetype=2) +
+  geom_vline(xintercept=negmean, color="red", linetype=2) + 
+  ggtitle("Days to Exit")
+
+ScatterBoxPlot(dTestS, "predictedToLeave", "daysToX", pt_alpha=0.2,
+               title="Distribution of days til exit")
+
+
+
