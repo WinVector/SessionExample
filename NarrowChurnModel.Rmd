@@ -1,0 +1,342 @@
+```{r}
+library(glmnet)
+library(gbm)
+library(ggplot2)
+library(WVPlots) # package code at https://github.com/WinVector/WVPlots
+```
+
+**Modeling functions**
+```{r functions}
+# ridge logistic regression
+
+# assuming xframe is entirely numeric
+ridge_predict_function = function(model, varnames) {
+  # to get around the 'unfullfilled promise' leak. blech.
+  force(model)
+  function(xframe) {
+    as.numeric(predict(model, newx=as.matrix(xframe[,varnames]), type="response"))
+  }
+}
+
+# assuming the xframe is entirely numeric
+# if there are categories, we would have to use
+#   model_matrix, or something
+# assuming family is one of c("binomial", "gaussian")
+#   should have a check for that
+ridge_model = function(xframe, y) {
+  model = glmnet(as.matrix(xframe), y, alpha=0,
+                 lambda=0.001, family="binomial")
+  varnames = colnames(xframe)
+  list(coef = coef(model),
+       deviance = deviance(model),
+       predfun = ridge_predict_function(model, varnames)
+  )
+}
+
+# gradient boosting functions
+gbm_predict_function = function(model, nTrees) {
+  force(model)
+  function(xframe) {
+    predict(model,newdata=xframe,type='response',
+            n.trees=nTrees)
+  }
+}
+
+gbm_model = function(dframe, formula, weights=NULL) {
+  if(is.null(weights)) {
+    nrows = dim(dframe)[1]
+    weights=numeric(nrows)+1 # all 1
+  }
+  modelGBM <- gbm(as.formula(formula),
+                  data=dTrainS,
+                  weights=weights,
+                  distribution='bernoulli',
+                  n.trees=400,
+                  interaction.depth=1, # additive model, to make it compatible with ridge regression
+                  shrinkage=0.05,
+                  bag.fraction=0.5,
+                  keep.data=FALSE,
+                  cv.folds=5)
+  print(summary(modelGBM))
+  nTrees <- gbm.perf(modelGBM)
+  print(nTrees)
+  list(predfun = gbm_predict_function(modelGBM, nTrees),
+       varinfs = summary(modelGBM))
+}
+
+get_deviance = function(y, pred) {
+  -2*sum(y*log(pred) + (1-y)*log(1-pred))
+}
+
+null_deviance = function(y) {
+  get_deviance(y, mean(y))
+}
+
+
+# stepwise ridge regression
+add_var = function(xframe, y, current_vars, current_dev, candidate_vars) {
+  best_dev = current_dev
+  newvar = NULL
+  for(var in candidate_vars) {
+     active=c(current_vars, var)
+     xf = xframe[,active]
+     if(length(active) > 1) {
+     model = glmnet(as.matrix(xf), y,
+                    alpha=0, lambda=0.001, family="binomial")
+     } else {
+       model =glm.fit(xframe[,active], y, family=binomial(link="logit"))
+     }
+     moddev = deviance(model)
+     if(moddev < best_dev) {
+       newvar = var
+       best_dev = moddev
+     }
+  }
+  improvement = 1 - (best_dev/current_dev)
+  list(current_vars= c(current_vars, newvar),
+       current_dev = best_dev,
+       improvement = improvement)
+}
+
+# evaluate model on holdout
+evaluate = function(model, data, y, label) {
+  pred = model$predfun(data)
+  deviance = get_deviance(y, pred)
+  predictedToLeave = pred>0.5
+
+  # confusion matrix
+  cmat = table(pred=predictedToLeave, actual=y)
+  recall = cmat[2,2]/sum(cmat[,2])
+  precision = cmat[2,2]/sum(cmat[2,])
+  accuracy = sum(diag(cmat))/sum(cmat)
+
+  data.frame(label=label, deviance=deviance, recall=recall, precision=precision, accuracy=accuracy)
+}
+
+# xvar is integral
+dist_and_mean = function(frm, xvar, title, meanlabel) {
+  meanval = mean(frm[[xvar]])
+  mode = max(table(frm[[xvar]]))
+  print(paste("Mean days until exit:", meanval))
+
+  DiscreteDistribution(frm, xvar, title=title) +
+    geom_vline(xintercept=meanval, color="blue", linetype=2)+
+    annotate("text", x=meanval, y=mode,
+             hjust=0, vjust=0,
+             label=meanlabel,
+             color="blue")
+}
+
+# same as above, but I'm using the filters to identify the set of interest,
+# and the baseline counts
+dist_and_mean_with_comparison = function(frm, model_filter, base_filter, xvar, title, meanlabel) {
+  pmod = dist_and_mean(frm[model_filter, ], xvar, title, meanlabel)
+  pmod +stat_summary(data=frm[base_filter,], aes(x=daysToX, y=1, ymin=0),
+               fun.y=sum, fun.ymax=sum, geom="linerange", size=5, alpha=0.25, color="darkgreen")
+}
+
+# evaluate model on timeliness.
+evaluate_timeliness = function(model, hdata, y, label) {
+  pred = model$predfun(hdata)
+  deviance = get_deviance(y, pred)
+  hdata$predictedToLeave = pred>0.5
+  
+  # fix the Infs in the data
+  isInf = hdata$daysToX == Inf # shouldn't be many of them
+  maxfinite = max(hdata$daysToX[!isInf])
+  hdata$daysToX[isInf] = maxfinite
+
+
+  # how long on average until flagged customers leave?
+  posmean = mean(hdata[hdata$predictedToLeave, "daysToX"])
+  print(paste(label, ":Flagged customers leave in", posmean, "days on average"))
+
+  # how long on average until unflagged customers leave?
+  negmean = mean(hdata[!hdata$predictedToLeave, "daysToX"])
+  print(paste(label, ":Unflagged customers leave in", negmean, "days on average"))
+
+  # how long until identified true positives leave?
+  tpfilter = hdata$predictedToLeave & hdata[[yVar]]
+  tpmean = mean(hdata[tpfilter, "daysToX"])
+  print(paste(label, ":True positive flagged customers leave in", tpmean, "days on average"))
+
+  print(dist_and_mean_with_comparison(hdata, model_filter=tpfilter, base_filter=y, "daysToX",
+                      paste(label, "Distribution of days til exit, true positives"),
+                      "mean days til exit"))
+
+  print(ScatterBoxPlot(hdata, "predictedToLeave", "daysToX", pt_alpha=0.2,
+                 title=paste(label, "Distribution of days til exit")))
+
+}
+
+gainplot = function(model, data, yvar, label) {
+  data$pred = model$predfun(data)
+  data$predictedToLeave = data$pred > 0.5
+  GainCurvePlot(data, "pred", yvar, title=label)
+}
+
+# returns final set of variables, along with improvements and deviances
+# use the variables to refit the final model
+stepwise_ridge = function(data, vars, yVar, min_improve=1e-6) {
+  current_vars=c()
+  candidate_vars = vars
+  devs = numeric(length(vars))
+  improvement = numeric(length(vars))
+  current_dev=null_deviance(data[[yVar]])
+  do_continue=TRUE
+  while(do_continue) {
+    iter = add_var(data, data[[yVar]], current_vars, current_dev, candidate_vars)
+    current_vars = iter$current_vars
+    current_dev = iter$current_dev
+
+    count = length(current_vars)
+    devs[count] = current_dev
+    improvement[count] = iter$improvement
+    candidate_vars = setdiff(vars, current_vars)
+   #  print(current_vars)
+    do_continue = (length(candidate_vars) > 0) && (iter$improvement > min_improve)
+  }
+  list(current_vars = current_vars, deviances=devs, improvement=improvement)
+}
+```
+
+**Modeling**
+
+First, null model and wide ridge model
+```{r basemodels}
+# loads vars (names of vars), yVar (name of y column),
+# dTrainS, dTestS
+load("wideData.rData")
+
+# number of candiate variables
+length(vars)
+
+# fix the Infs in the training data
+isInf = dTrainS$daysToX == Inf # shouldn't be many of them
+maxfinite = max(dTrainS$daysToX[!isInf])
+dTrainS$daysToX[isInf] = maxfinite
+
+# null deviance
+null_deviance(dTrainS[[yVar]])
+
+# model using all variables
+allvar_model = ridge_model(dTrainS[,vars], dTrainS[[yVar]])
+deviance(allvar_model)
+```
+
+Next, the greedy forward stepwise regression
+```{r stepmodel}
+modelparams = stepwise_ridge(dTrainS, vars, yVar)
+current_vars = modelparams$current_vars
+devs = modelparams$deviances
+improvement=modelparams$improvement
+
+# number of variables selected
+length(current_vars)
+# display the selected windows
+current_vars
+
+final_model = ridge_model(dTrainS[,current_vars], dTrainS[[yVar]])
+final_model$deviance
+```
+
+Examine the incremental model performance
+```{r stepexam}
+numvars = length(current_vars)
+plotframe = data.frame(nvars=1:numvars, deviance = devs[1:numvars], improvement = improvement[1:numvars])
+
+ggplot(plotframe, aes(x=nvars, y=deviance)) + geom_point() + geom_line()
+ggplot(plotframe, aes(x=nvars, y=improvement)) + geom_point() + geom_line()
+```
+
+Depending on how you interpret the improvement graph, you want 2 variables (the max), 4, or 6 variables (the "elbow").
+```{r smallmodels}
+final2_model = ridge_model(dTrainS[,current_vars[1:2]], dTrainS[[yVar]])
+final4_model = ridge_model(dTrainS[,current_vars[1:4]], dTrainS[[yVar]])
+final6_model = ridge_model(dTrainS[,current_vars[1:6]], dTrainS[[yVar]])
+deviance(final2_model)
+deviance(final4_model)
+deviance(final6_model)
+```
+
+Compare all the (non-trivial) models.
+```{r compare1}
+rbind(evaluate(allvar_model, dTestS, dTestS[[yVar]], "all variables"),
+      evaluate(final_model, dTestS, dTestS[[yVar]], "stepwise run"),
+      evaluate(final2_model, dTestS, dTestS[[yVar]], "best 2 variables"),
+      evaluate(final4_model, dTestS, dTestS[[yVar]], "best 4 variables"),
+      evaluate(final6_model, dTestS, dTestS[[yVar]], "best 6 variables"))
+```
+
+**Evaluation**
+
+Pick the best model, and evaluate it and its timeliness on hold-out data
+```{r eval1}
+bestridge_model = final6_model
+bestn = 6
+gainplot(bestridge_model, dTestS, yVar, paste("Stepwise ridge,", bestn, "best variables"))
+evaluate_timeliness(final6_model, dTestS, dTestS[[yVar]], paste("Stepwise ridge,", bestn, "best variables"))
+```
+
+**Gradient Boosting** 
+Just for fun, lets look at the gradient boosting solution
+
+```{r gbm}
+set.seed(43534656) # just so this reproduces
+
+formula = paste(yVar, "~", paste(vars, collapse="+"))
+modelGBM = gbm_model(dTrainS, formula)
+
+# compare to the best ridge model
+rbind(evaluate(bestridge_model, dTestS, dTestS[[yVar]], "best stepwise model"),
+      evaluate(modelGBM, dTestS, dTestS[[yVar]], "gbm model, interaction=1"))
+
+gainplot(modelGBM, dTestS, yVar, "GBM, interaction level=1")
+evaluate_timeliness(modelGBM, dTestS, dTestS[[yVar]], "GBM, interaction level=1")
+```
+
+What did the gbm model miss?
+```{r difference}
+# the exiting customers that the ridge model identified
+ridge_tp = (bestridge_model$predfun(dTestS) > 0.5) & dTestS[[yVar]]
+
+# the exiting customers the gbm model identified
+gbm_tp = (modelGBM$predfun(dTestS) > 0.5) & dTestS[[yVar]]
+
+sum(ridge_tp)
+sum(gbm_tp)
+# what did gbm miss that ridge found?
+not_gbm = ridge_tp &! gbm_tp
+sum(not_gbm)
+table(dTestS[not_gbm, "daysToX"])
+
+# what did ridge miss that gbm found?
+not_ridge = gbm_tp & !ridge_tp
+sum(not_ridge)
+table(dTestS[not_ridge, "daysToX"])
+```
+
+One last crazy experiment. What if we use the variables that gbm chose?
+```{r gnm_varselect}
+ggplot(modelGBM$varinfs[1:20,], aes(x=1:20, y=rel.inf)) + geom_point() + geom_line()
+
+
+# the elbow is either at 3 or 7. Let's use 7
+
+usevars = as.character(modelGBM$varinfs$var[1:7])
+# build a logistic regression model with these variables
+model_gbmvars = ridge_model(dTrainS[,usevars], dTrainS[[yVar]])
+# build a gbm with these variables
+fmla = paste(yVar, "~", paste(usevars, collapse="+"))
+model_gbmsmall = gbm_model(dTrainS, fmla)
+
+rbind(evaluate(bestridge_model, dTestS, dTestS[[yVar]], "best stepwise model"),
+      evaluate(modelGBM, dTestS, dTestS[[yVar]], "gbm model, interaction=1"), 
+      evaluate(model_gbmvars, dTestS, dTestS[[yVar]], "ridge model with best gbm variables"),
+      evaluate(model_gbmsmall, dTestS, dTestS[[yVar]], "gbm model with best gbm variables"))
+gainplot(model_gbmvars, dTestS, yVar, "ridge model with best gbm variables")
+evaluate_timeliness(model_gbmvars, dTestS, dTestS[[yVar]], "ridge model with best gbm variables")
+evaluate_timeliness(model_gbmsmall, dTestS, dTestS[[yVar]], "gbm model with best gbm variables")
+
+```
+
